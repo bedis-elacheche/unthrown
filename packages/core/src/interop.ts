@@ -114,7 +114,9 @@ export function fromThrowable<A extends unknown[], T, R>(
   return (...args: A): Result<T, E> => {
     try {
       const value = fn(...args);
-      return isThenable(value) ? thenableReturnDefect<T, E>(value) : (Ok(value) as Result<T, E>);
+      return isThenable(value)
+        ? thenableReturnDefect<T, E>(value, SYNC_FN_THENABLE)
+        : (Ok(value) as Result<T, E>);
     } catch (cause) {
       return qualifyToResult<T, E>(cause, triage);
     }
@@ -160,7 +162,9 @@ export function fromSafeThrowable<A extends unknown[], T>(
   return (...args: A): Result<T, never> => {
     try {
       const value = fn(...args);
-      return isThenable(value) ? thenableReturnDefect<T, never>(value) : Ok(value);
+      return isThenable(value)
+        ? thenableReturnDefect<T, never>(value, SYNC_FN_THENABLE)
+        : Ok(value);
     } catch (cause) {
       return defectRes<T, never>(cause);
     }
@@ -412,34 +416,50 @@ function qualifyToResult<T, E>(
 }
 
 /**
- * The Defect minted when a **synchronous** boundary's `fn` returns a thenable —
- * i.e. an `async` function was handed to {@link fromThrowable} /
- * {@link fromSafeThrowable}.
+ * The message for {@link thenableReturnDefect} at a **synchronous boundary** —
+ * an `async` function handed to {@link fromThrowable} / {@link fromSafeThrowable}.
+ *
+ * @internal
+ */
+const SYNC_FN_THENABLE =
+  "unthrown: fromThrowable/fromSafeThrowable wrap a SYNCHRONOUS function, but `fn` returned a thenable — its rejection would escape qualification. Use fromPromise/fromSafePromise instead.";
+
+/**
+ * The message for {@link thenableReturnDefect} in an **accumulating aggregate** —
+ * an `async` `merge` handed to {@link validateAll} and friends.
+ *
+ * @internal
+ */
+const MERGE_THENABLE =
+  "unthrown: an accumulating aggregate's `merge` must be SYNCHRONOUS, but it returned a thenable — its rejection would escape qualification.";
+
+/**
+ * The Defect minted where a callback that must be **synchronous** returned a
+ * thenable: a `fn` handed to {@link fromThrowable} / {@link fromSafeThrowable},
+ * or a `merge` handed to an accumulating aggregate.
  *
  * @remarks
  * This is the sibling of the thenable-`qualify` net in {@link qualifyToResult},
  * and it closes a strictly worse hole. A synchronous boundary only ever sees a
  * synchronous `throw`, so an async `fn`'s rejection never reaches `qualify` at
  * all: it would sit inside `Ok(<Promise>)`, un-triaged, and then float as an
- * unhandled rejection — which terminates the process on Node by default.
+ * unhandled rejection — which terminates the process on Node by default. An
+ * async `merge` is the same hole one channel over: `Err(<Promise>)`.
  *
- * Unlike the combinator callbacks, this cannot be banned at compile time
- * without collateral damage: `T & NotThenable<T>` on `fn`'s return makes a
- * **generic** function unassignable, so `fromSafeThrowable(structuredClone)`
- * stops compiling and `T` collapses to `unknown`. (The phantom rest-tuple guard
- * `fromPromise` uses fares worse.) So the ban is enforced here, at runtime,
- * where it costs nothing: a Defect, plus adopt-and-silence so the orphaned
- * rejection cannot float.
+ * The `fn` case cannot be banned at compile time without collateral damage:
+ * `T & NotThenable<T>` on `fn`'s return makes a **generic** function
+ * unassignable, so `fromSafeThrowable(structuredClone)` stops compiling and `T`
+ * collapses to `unknown`. (The phantom rest-tuple guard `fromPromise` uses fares
+ * worse.) `merge` *is* `NotThenable`-constrained, but a cast or an untyped
+ * caller still reaches here. Either way the runtime answer is the same, and it
+ * costs nothing: a Defect, plus adopt-and-silence so the orphaned rejection
+ * cannot float.
  *
  * @internal
  */
-function thenableReturnDefect<T, E>(value: unknown): Result<T, E> {
-  void Promise.resolve(value).then(undefined, () => undefined);
-  return defectRes<T, E>(
-    new TypeError(
-      "unthrown: fromThrowable/fromSafeThrowable wrap a SYNCHRONOUS function, but `fn` returned a thenable — its rejection would escape qualification. Use fromPromise/fromSafePromise instead.",
-    ),
-  );
+function thenableReturnDefect<T, E>(value: unknown, message: string): Result<T, E> {
+  silenceIfThenable(value);
+  return defectRes<T, E>(new TypeError(message));
 }
 
 /**
@@ -464,6 +484,31 @@ type AllOk<
   Ts extends readonly unknown[],
 > = number extends Rs["length"] ? Ts[number][] : Ts;
 
+/**
+ * A `[key, error]` pair from a record aggregate, correlated per key.
+ *
+ * @remarks
+ * `-?` because the mapped type is homomorphic: an optional input key would
+ * otherwise carry its optionality through and put `undefined` in the entry
+ * union, breaking the documented `([key, error]) => …` destructure. An entry
+ * whose error channel is `never` (an infallible input — every `@unthrown/drizzle`
+ * read) is dropped rather than emitted as an uninhabited `[K, never]` arm, which
+ * a `switch` over the key would still have to write a dead case for.
+ *
+ * @internal
+ */
+type DictErrEntry<R> = {
+  [K in keyof R]-?: [ErrOf<R[K]>] extends [never] ? never : readonly [K, ErrOf<R[K]>];
+}[keyof R];
+
+/** The {@link AsyncResult} counterpart of {@link DictErrEntry}. @internal */
+type AsyncDictErrEntry<R> = {
+  [K in keyof R]-?: [AsyncErrOf<R[K]>] extends [never] ? never : readonly [K, AsyncErrOf<R[K]>];
+}[keyof R];
+
+/** A non-empty readonly list — `merge` runs only when an `Err` was collected. @internal */
+type NonEmpty<T> = readonly [T, ...T[]];
+
 /** A record of `Result`s — the input to {@link allFromDict}. */
 type ResultRecord = Record<string, Result<unknown, unknown>>;
 /** A record of `AsyncResult`s — the input to {@link allFromDictAsync}. */
@@ -480,11 +525,39 @@ function nonResultDefect(): Result<unknown, unknown> {
   return defectRes(new TypeError("unthrown: aggregate received a non-Result element"));
 }
 
-function foldArray(results: readonly Result<unknown, unknown>[]): Result<unknown, unknown> {
+/**
+ * Resolve every input concurrently (order preserved), adopting each one
+ * defensively: a cast/untyped rejecting thenable becomes a `Defect` rather than
+ * rejecting the internal promise, so the "an `AsyncResult`'s internal promise
+ * never rejects" invariant holds even for out-of-contract input.
+ *
+ * @internal
+ */
+function settleAll(
+  results: readonly AsyncResult<unknown, unknown>[],
+): Promise<readonly Result<unknown, unknown>[]> {
+  return Promise.all(
+    results.map((r) =>
+      Promise.resolve(r).then(
+        (x) => x,
+        (cause) => defectRes(cause),
+      ),
+    ),
+  ) as Promise<readonly Result<unknown, unknown>[]>;
+}
+
+/** An accumulated `[index, error]` pair. @internal */
+type IndexedErr = readonly [number, unknown];
+
+function foldArray(
+  results: readonly Result<unknown, unknown>[],
+  merge?: (errors: NonEmpty<IndexedErr>) => unknown,
+): Result<unknown, unknown> {
   let firstErr: Result<unknown, unknown> | undefined;
   let firstDefect: Result<unknown, unknown> | undefined;
   const values: unknown[] = [];
-  for (const r of results) {
+  const errors: IndexedErr[] = [];
+  for (const [i, r] of results.entries()) {
     if (!isResult(r)) {
       // Out-of-contract element (a hole/undefined/non-Result, reachable only via
       // untyped or cast input). Surface it as a Defect — an unexpected failure —
@@ -496,10 +569,33 @@ function foldArray(results: readonly Result<unknown, unknown>[]): Result<unknown
     if (r.tag === "Defect") {
       firstDefect ??= r;
       break; // any Defect dominates — nothing later can change the outcome
-    } else if (r.tag === "Err") firstErr ??= r;
-    else values.push(r.value);
+    } else if (r.tag === "Err") {
+      // Fail-fast keeps the first Err; the validating fold accumulates every
+      // one, paired with its index so the record fold can name it.
+      if (merge) errors.push([i, r.error]);
+      else firstErr ??= r;
+    } else values.push(r.value);
   }
-  return firstDefect ?? firstErr ?? Ok(values);
+  // A Defect dominates even the accumulated errors: something in this batch is
+  // broken in a way nobody modeled, so the modeled violations it beat were
+  // computed alongside broken code and `merge` is never called.
+  if (firstDefect) return firstDefect;
+  if (merge && errors.length > 0) {
+    // `merge` is user code, so the throw → defect rule applies: nothing escapes
+    // an aggregate as a raw throw.
+    try {
+      const merged = merge(errors as unknown as NonEmpty<IndexedErr>);
+      // `merge` is `NotThenable`-constrained, but a cast/untyped caller can
+      // still hand us an async one. `Err(<Promise>)` would put an unqualified
+      // thenable in `E` and float its rejection — the same net the synchronous
+      // boundaries use, one channel over.
+      if (isThenable(merged)) return thenableReturnDefect(merged, MERGE_THENABLE);
+      return Err(merged);
+    } catch (cause) {
+      return defectRes(cause);
+    }
+  }
+  return firstErr ?? Ok(values);
 }
 
 /**
@@ -518,11 +614,27 @@ function foldArray(results: readonly Result<unknown, unknown>[]): Result<unknown
  *
  * @internal
  */
-function foldRecord(results: ResultRecord): Result<unknown, unknown> {
+function foldRecord(
+  results: ResultRecord,
+  merge?: (entries: NonEmpty<readonly [string, unknown]>) => unknown,
+): Result<unknown, unknown> {
   const keys = Object.keys(results);
-  return foldArray(Object.values(results)).map((values) =>
-    Object.fromEntries(keys.map((key, i) => [key, (values as unknown[])[i]])),
-  );
+  return foldArray(
+    Object.values(results),
+    // The positional fold accumulates `[index, error]`; the record form names
+    // each one by pairing the index back onto its key before `merge` sees it.
+    merge && ((errors) => merge(nameErrors(errors, keys))),
+  ).map((values) => Object.fromEntries(keys.map((key, i) => [key, (values as unknown[])[i]])));
+}
+
+/** Drop the accumulated indices — the positional forms merge errors alone. @internal */
+function stripIndices<E>(errors: NonEmpty<IndexedErr>): NonEmpty<E> {
+  return errors.map(([, e]) => e) as unknown as NonEmpty<E>;
+}
+
+/** Pair each accumulated index back onto its key. @internal */
+function nameErrors<Entry>(errors: NonEmpty<IndexedErr>, keys: readonly string[]): NonEmpty<Entry> {
+  return errors.map(([i, e]) => [keys[i] as string, e]) as unknown as NonEmpty<Entry>;
 }
 
 /**
@@ -535,7 +647,8 @@ function foldRecord(results: ResultRecord): Result<unknown, unknown> {
  * `Err`. A **fixed tuple** keeps its positional types — `all([Ok(1), Ok("a")])`
  * is `Result<[number, string], …>` — while a **dynamic array** `Result<T, E>[]`
  * collapses to `Result<T[], E>` with no cast. For a **record** keyed by name,
- * use {@link allFromDict}.
+ * use {@link allFromDict}. To report **every** `Err` instead of only the first,
+ * use {@link validateAll}.
  *
  * @category Aggregate
  *
@@ -564,7 +677,9 @@ export function all<Rs extends readonly Result<unknown, unknown>[]>(
  *
  * @remarks
  * Same folding rules as {@link all}: first `Err` short-circuits, any `Defect`
- * dominates. This is **not** error accumulation.
+ * dominates. This is **not** error accumulation — for that, reach for
+ * {@link validateAllFromDict}, which accumulates every `Err` and folds them into
+ * one modeled error.
  *
  * @category Aggregate
  *
@@ -593,7 +708,8 @@ export function allFromDict<R extends ResultRecord>(
  * The inputs are resolved **concurrently** (order preserved); the resolved
  * `Result`s are then folded with the same rules as {@link all} — first `Err`
  * short-circuits, any `Defect` dominates. As ever, the returned `AsyncResult`'s
- * internal promise never rejects. For a **record**, use {@link allFromDictAsync}.
+ * internal promise never rejects. For a **record**, use {@link allFromDictAsync};
+ * to report **every** `Err`, use {@link validateAllAsync}.
  *
  * @category Aggregate
  *
@@ -611,19 +727,9 @@ export function allFromDict<R extends ResultRecord>(
 export function allAsync<Rs extends readonly AsyncResult<unknown, unknown>[]>(
   results: readonly [...Rs],
 ): AsyncResult<AllOk<Rs, { [K in keyof Rs]: AsyncOkOf<Rs[K]> }>, AsyncErrOf<Rs[number]>> {
-  // Each library AsyncResult is a never-rejecting thenable, so Promise.all
-  // adopts them; `foldArray` then applies the all() rules. Adopt every input
-  // defensively — a cast/untyped rejecting thenable becomes a `Defect` rather
-  // than rejecting the internal promise (the "internal promise never rejects"
-  // invariant holds even for out-of-contract input).
-  const settled = Promise.all(
-    results.map((r) =>
-      Promise.resolve(r).then(
-        (x) => x,
-        (cause) => defectRes(cause),
-      ),
-    ),
-  ).then((resolved) => foldArray(resolved as readonly Result<unknown, unknown>[]));
+  // Each library AsyncResult is a never-rejecting thenable, so `settleAll`
+  // adopts them concurrently; `foldArray` then applies the all() rules.
+  const settled = settleAll(results).then((resolved) => foldArray(resolved));
   return new AsyncRes(settled) as unknown as AsyncResult<
     AllOk<Rs, { [K in keyof Rs]: AsyncOkOf<Rs[K]> }>,
     AsyncErrOf<Rs[number]>
@@ -636,7 +742,8 @@ export function allAsync<Rs extends readonly AsyncResult<unknown, unknown>[]>(
  *
  * @remarks
  * Resolved concurrently (order preserved), folded with the {@link all} rules,
- * and the internal promise never rejects.
+ * and the internal promise never rejects. To report **every** `Err`, use
+ * {@link validateAllFromDictAsync}.
  *
  * @category Aggregate
  *
@@ -655,25 +762,206 @@ export function allFromDictAsync<R extends AsyncResultRecord>(
   results: R,
 ): AsyncResult<{ [K in keyof R]: AsyncOkOf<R[K]> }, AsyncErrOf<R[keyof R]>> {
   const keys = Object.keys(results);
-  const settled = Promise.all(
-    // Adopt each input defensively (see `allAsync`): a rejecting thenable
-    // becomes a `Defect`, so the internal promise never rejects.
-    Object.values(results).map((ar) =>
-      Promise.resolve(ar).then(
-        (x) => x,
-        (cause) => defectRes(cause),
-      ),
-    ),
-  ).then((resolved) =>
-    // The positional fold applies the `all` rules; the keys are paired back on
-    // afterwards, with the same `Object.fromEntries` prototype guarantee
-    // `foldRecord` relies on.
-    foldArray(resolved as readonly Result<unknown, unknown>[]).map((values) =>
-      Object.fromEntries(keys.map((key, i) => [key, (values as unknown[])[i]])),
-    ),
+  // Re-pair the settled results with their keys and hand them to the sync record
+  // fold, so the `all` rules and the `Object.fromEntries` prototype guarantee
+  // come from one place.
+  const settled = settleAll(Object.values(results)).then((resolved) =>
+    foldRecord(Object.fromEntries(keys.map((key, i) => [key, resolved[i]])) as ResultRecord),
   );
   return new AsyncRes(settled) as unknown as AsyncResult<
     { [K in keyof R]: AsyncOkOf<R[K]> },
     AsyncErrOf<R[keyof R]>
   >;
+}
+
+/**
+ * Collect a tuple/array of {@link Result}s, **accumulating every** `Err` and
+ * merging them into a single modeled error — the accumulating counterpart of
+ * {@link all}.
+ *
+ * @remarks
+ * Same success channel as {@link all}: a **fixed tuple** keeps its positional
+ * types, a **dynamic array** collapses to `Result<T[], E2>`. The difference is
+ * the error channel — instead of the first `Err` winning, every `Err` is
+ * collected in input order and handed to `merge`, whose return becomes the
+ * modeled error.
+ *
+ * `merge` receives a **non-empty** list, so it is total: it is called only when
+ * at least one `Err` was collected. It is **not** called when every element is
+ * `Ok`, nor when a `Defect` is present.
+ *
+ * Any `Defect` still **dominates** — it wins over the accumulated errors, which
+ * are discarded and never reach `merge`. A defect means something in this batch
+ * failed in a way nobody modeled, so the violations computed alongside it are
+ * not trustworthy. An out-of-contract non-`Result` element becomes a
+ * `TypeError`-caused `Defect` the same way, and a throw inside `merge` becomes
+ * a `Defect` too.
+ *
+ * `merge` must be **synchronous** — an `async` one is a compile error
+ * ({@link NotThenable}), since a `Promise` in `E` is an unqualified rejection.
+ *
+ * For **schema-shaped** input (a request body, a form), reach for
+ * `@unthrown/standard-schema`'s `fromSchema` instead — a validator already
+ * hands you every issue as the modeled error. `validateAll` is for independent
+ * checks you wrote yourself. For a **record** keyed by name, use
+ * {@link validateAllFromDict}.
+ *
+ * @typeParam Rs - the tuple/array of input `Result` types.
+ * @typeParam E2 - the merged error type.
+ * @param results - the results to collect.
+ * @param merge - folds the collected errors into one modeled error.
+ *
+ * @category Aggregate
+ *
+ * @example
+ * ```ts
+ * import { validateAll, Ok, Err } from "unthrown";
+ *
+ * // every Err is collected, not just the first
+ * validateAll([Ok(1), Err("stock"), Err("credit")], (errors) => errors.join(" and "));
+ * // => Err("stock and credit")
+ *
+ * // all-Ok keeps the positional tuple; `merge` never runs
+ * validateAll([Ok(1), Ok("a")], (errors) => errors.join());
+ * // => Ok([1, "a"]) typed Result<[number, string], string>
+ * ```
+ */
+export function validateAll<Rs extends readonly Result<unknown, unknown>[], E2>(
+  results: readonly [...Rs],
+  merge: (errors: NonEmpty<ErrOf<Rs[number]>>) => E2 & NotThenable<E2>,
+): Result<AllOk<Rs, { [K in keyof Rs]: OkOf<Rs[K]> }>, E2> {
+  return foldArray(results, (errors) => merge(stripIndices(errors))) as unknown as Result<
+    AllOk<Rs, { [K in keyof Rs]: OkOf<Rs[K]> }>,
+    E2
+  >;
+}
+
+/**
+ * Collect a **record** of {@link Result}s, accumulating every `Err` — the
+ * accumulating counterpart of {@link allFromDict}, and the named counterpart of
+ * {@link validateAll}.
+ *
+ * @remarks
+ * `merge` receives a non-empty list of **`[key, error]` entries**, correlated
+ * per key: `{ a: Result<A, E1>; b: Result<B, E2> }` yields
+ * `["a", E1] | ["b", E2]`, so a `switch` on the key narrows the error and an
+ * impossible pairing does not typecheck. That is what keeps two checks sharing
+ * one error type distinguishable. Entries come in `Object.keys` order.
+ *
+ * Every other rule matches {@link validateAll}: any `Defect` dominates and
+ * discards the accumulated errors, a throw in `merge` becomes a `Defect`, and
+ * `merge` must be synchronous.
+ *
+ * @typeParam R - the record of input `Result` types.
+ * @typeParam E2 - the merged error type.
+ * @param results - the results to collect, keyed by name.
+ * @param merge - folds the collected `[key, error]` entries into one error.
+ *
+ * @category Aggregate
+ *
+ * @example
+ * ```ts
+ * import { validateAllFromDict, Ok, Err } from "unthrown";
+ *
+ * validateAllFromDict(
+ *   { vatRate: Err("out of range"), currency: Ok("EUR"), dueDate: Err("past") },
+ *   (entries) => entries.map(([key, error]) => `${key}: ${error}`).join("; "),
+ * );
+ * // => Err("vatRate: out of range; dueDate: past")
+ * ```
+ */
+export function validateAllFromDict<R extends ResultRecord, E2>(
+  results: R,
+  merge: (entries: NonEmpty<DictErrEntry<R>>) => E2 & NotThenable<E2>,
+): Result<{ [K in keyof R]: OkOf<R[K]> }, E2> {
+  return foldRecord(results, (entries) =>
+    merge(entries as NonEmpty<DictErrEntry<R>>),
+  ) as unknown as Result<{ [K in keyof R]: OkOf<R[K]> }, E2>;
+}
+
+/**
+ * The asynchronous counterpart of {@link validateAll}: collect a tuple/array of
+ * {@link AsyncResult}s, accumulating every `Err` into one merged error.
+ *
+ * @remarks
+ * Every {@link validateAll} rule holds, with the inputs resolved
+ * **concurrently** (order preserved) — as with {@link allAsync}, no work is
+ * short-circuited either way; the fail-fast/accumulating split is purely which
+ * errors get reported. The internal promise never rejects: an out-of-contract
+ * rejecting thenable becomes a dominating `Defect`. `merge` stays synchronous
+ * here too — this is exactly where its rejection would land unqualified in `E`.
+ * For a **record**, use {@link validateAllFromDictAsync}.
+ *
+ * @typeParam Rs - the tuple/array of input `AsyncResult` types.
+ * @typeParam E2 - the merged error type.
+ * @param results - the async results to collect.
+ * @param merge - folds the collected errors into one modeled error.
+ *
+ * @category Aggregate
+ *
+ * @example
+ * ```ts
+ * import { validateAllAsync, OkAsync, ErrAsync } from "unthrown";
+ *
+ * const checked = validateAllAsync(
+ *   [OkAsync(1), ErrAsync("stock"), ErrAsync("credit")],
+ *   (errors) => errors.join(" and "),
+ * );
+ * // (await checked) => Err("stock and credit")
+ * ```
+ */
+export function validateAllAsync<Rs extends readonly AsyncResult<unknown, unknown>[], E2>(
+  results: readonly [...Rs],
+  merge: (errors: NonEmpty<AsyncErrOf<Rs[number]>>) => E2 & NotThenable<E2>,
+): AsyncResult<AllOk<Rs, { [K in keyof Rs]: AsyncOkOf<Rs[K]> }>, E2> {
+  const settled = settleAll(results).then((resolved) =>
+    foldArray(resolved, (errors) => merge(stripIndices(errors))),
+  );
+  return new AsyncRes(settled) as unknown as AsyncResult<
+    AllOk<Rs, { [K in keyof Rs]: AsyncOkOf<Rs[K]> }>,
+    E2
+  >;
+}
+
+/**
+ * The asynchronous counterpart of {@link validateAllFromDict}: collect a record
+ * of {@link AsyncResult}s, accumulating every `Err` into one merged error.
+ *
+ * @remarks
+ * The {@link validateAllFromDict} rules, over inputs resolved concurrently as
+ * in {@link validateAllAsync}.
+ *
+ * @typeParam R - the record of input `AsyncResult` types.
+ * @typeParam E2 - the merged error type.
+ * @param results - the async results to collect, keyed by name.
+ * @param merge - folds the collected `[key, error]` entries into one error.
+ *
+ * @category Aggregate
+ *
+ * @example
+ * ```ts
+ * import { validateAllFromDictAsync, OkAsync, ErrAsync } from "unthrown";
+ *
+ * const checked = validateAllFromDictAsync(
+ *   { stock: ErrAsync("none left"), credit: OkAsync(500) },
+ *   (entries) => entries.map(([key, error]) => `${key}: ${error}`).join("; "),
+ * );
+ * // (await checked) => Err("stock: none left")
+ * ```
+ */
+export function validateAllFromDictAsync<R extends AsyncResultRecord, E2>(
+  results: R,
+  merge: (entries: NonEmpty<AsyncDictErrEntry<R>>) => E2 & NotThenable<E2>,
+): AsyncResult<{ [K in keyof R]: AsyncOkOf<R[K]> }, E2> {
+  const keys = Object.keys(results);
+  // Re-pair the settled results with their keys and hand them to the sync record
+  // fold — the key naming, the `Object.fromEntries` prototype guarantee and the
+  // throw → defect net all come from there rather than being restated.
+  const settled = settleAll(Object.values(results)).then((resolved) =>
+    foldRecord(
+      Object.fromEntries(keys.map((key, i) => [key, resolved[i]])) as ResultRecord,
+      (entries) => merge(entries as NonEmpty<AsyncDictErrEntry<R>>),
+    ),
+  );
+  return new AsyncRes(settled) as unknown as AsyncResult<{ [K in keyof R]: AsyncOkOf<R[K]> }, E2>;
 }

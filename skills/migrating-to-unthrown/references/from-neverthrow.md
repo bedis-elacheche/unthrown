@@ -4,27 +4,27 @@ Apply mechanically; the judgment calls live in SKILL.md's decide-once list.
 
 ## Mapping table
 
-| neverthrow                                | unthrown                                          | Notes                                                                           |
-| ----------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `ok(v)` / `err(e)`                        | `Ok(v)` / `Err(e)`                                | capitalized free functions                                                      |
-| `okAsync(v)` / `errAsync(e)`              | `OkAsync(v)` / `ErrAsync(e)`                      | pre-lifted async constructors                                                   |
-| `result.map(f)`                           | same                                              | callback must be synchronous                                                    |
-| `result.andThen(f)`                       | `result.flatMap(f)`                               | one name per concept                                                            |
-| `result.andTee(f)` / `andThrough(f)`      | `tap(f)` / `flatTap(f)`                           |                                                                                 |
-| `result.mapErr(f)`                        | `mapErrCases((matcher) => …)`                     | exhaustive: one `.with(…)` arm per case in `E` — see rewrite below              |
-| `result.orElse(f)`                        | `flatMapErrCases(…)` or `recoverErrCases(…)`      | fallback `Result` vs plain recovery value — see rewrite below                   |
-| `result.match(okFn, errFn)`               | `match({ ok, errCases: (matcher) => …, defect })` | object handlers; the `defect` arm is new and mandatory                          |
-| `result.unwrapOr(v)`                      | `getOr(v)`                                        | all `unwrap*` names are removed; still panics on a Defect                       |
-| `result.isOk()` / `isErr()`               | same                                              | plus `isDefect()`                                                               |
-| `result.value` / `result.error`           | same, after narrowing                             |                                                                                 |
-| `ResultAsync`                             | `AsyncResult`                                     | `await` collapses it to a `Result`; it never rejects                            |
-| `ResultAsync.fromPromise(p, mapErr)`      | `fromPromise(p, qualify)`                         | `qualify(cause, defect)` must triage — the mapper was total, this is a decision |
-| `ResultAsync.fromSafePromise(p)`          | `fromSafePromise(p)`                              | a rejection becomes a `Defect`, not an `Err`                                    |
-| `Result.fromThrowable(fn, mapErr)`        | `fromThrowable(fn, qualify)`                      | wraps the function; same triage                                                 |
-| `Result.combine([...])`                   | `all([...])` / `allAsync([...])`                  | record variant: `allFromDict` / `allFromDictAsync`                              |
-| `Result.combineWithAllErrors([...])`      | —                                                 | accumulation is deliberately excluded — see gap below                           |
-| `safeTry(function* () { yield* … })`      | `Do()` / `DoAsync()` + `.bind(name, f)` + `.let`  | see rewrite below                                                               |
-| `fromPromise` re-thrown / `_unsafeUnwrap` | `get()` (needs `E = never`) / `getOrThrow()`      | type-gated extraction; no `_unsafe*` family                                     |
+| neverthrow                                | unthrown                                                       | Notes                                                                                                 |
+| ----------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `ok(v)` / `err(e)`                        | `Ok(v)` / `Err(e)`                                             | capitalized free functions                                                                            |
+| `okAsync(v)` / `errAsync(e)`              | `OkAsync(v)` / `ErrAsync(e)`                                   | pre-lifted async constructors                                                                         |
+| `result.map(f)`                           | same                                                           | callback must be synchronous                                                                          |
+| `result.andThen(f)`                       | `result.flatMap(f)`                                            | one name per concept                                                                                  |
+| `result.andTee(f)` / `andThrough(f)`      | `tap(f)` / `flatTap(f)`                                        |                                                                                                       |
+| `result.mapErr(f)`                        | `mapErrCases((matcher) => …)`                                  | exhaustive: one `.with(…)` arm per case in `E` — see rewrite below                                    |
+| `result.orElse(f)`                        | `flatMapErrCases(…)` or `recoverErrCases(…)`                   | fallback `Result` vs plain recovery value — see rewrite below                                         |
+| `result.match(okFn, errFn)`               | `match({ ok, errCases: (matcher) => …, defect })`              | object handlers; the `defect` arm is new and mandatory                                                |
+| `result.unwrapOr(v)`                      | `getOr(v)`                                                     | all `unwrap*` names are removed; still panics on a Defect                                             |
+| `result.isOk()` / `isErr()`               | same                                                           | plus `isDefect()`                                                                                     |
+| `result.value` / `result.error`           | same, after narrowing                                          |                                                                                                       |
+| `ResultAsync`                             | `AsyncResult`                                                  | `await` collapses it to a `Result`; it never rejects                                                  |
+| `ResultAsync.fromPromise(p, mapErr)`      | `fromPromise(p, qualify)`                                      | `qualify(cause, defect)` must triage — the mapper was total, this is a decision                       |
+| `ResultAsync.fromSafePromise(p)`          | `fromSafePromise(p)`                                           | a rejection becomes a `Defect`, not an `Err`                                                          |
+| `Result.fromThrowable(fn, mapErr)`        | `fromThrowable(fn, qualify)`                                   | wraps the function; same triage                                                                       |
+| `Result.combine([...])`                   | `all([...])` / `allAsync([...])`                               | record variant: `allFromDict` / `allFromDictAsync`                                                    |
+| `Result.combineWithAllErrors([...])`      | `validateAll([...], merge)` / `validateAllAsync([...], merge)` | `merge` is mandatory — see below; record variants: `validateAllFromDict` / `validateAllFromDictAsync` |
+| `safeTry(function* () { yield* … })`      | `Do()` / `DoAsync()` + `.bind(name, f)` + `.let`               | see rewrite below                                                                                     |
+| `fromPromise` re-thrown / `_unsafeUnwrap` | `get()` (needs `E = never`) / `getOrThrow()`                   | type-gated extraction; no `_unsafe*` family                                                           |
 
 ## The three non-mechanical rewrites
 
@@ -61,13 +61,30 @@ DoAsync()
   .map(({ user, prefs }) => ({ user, prefs }));
 ```
 
-## Gap: `combineWithAllErrors`
+## `combineWithAllErrors` → `validateAll`
 
-unthrown has no error accumulation, deliberately. Options, in order: validate
-with `@unthrown/standard-schema` (a validator's issue list is one modeled
-error carrying all issues); or model the aggregate as one error case whose
-payload holds the collected failures, built by folding the results yourself at
-that one site. Do not fake a `Validation` type.
+`validateAll` / `validateAllFromDict` (and the async pair `validateAllAsync` /
+`validateAllFromDictAsync`) accumulate every `Err` in input order — but they do
+**not** hand you the `Result<T[], E[]>` neverthrow returns. A mandatory
+`merge: (errors) => E2` folds the collected failures into one named domain
+error, because an `E[]` is a _shape_, not an anticipated failure, and it pushes
+"what does it mean that several rules failed?" to every consuming site forever.
+
+```ts
+validateAll(
+  [checkStock(o), checkCredit(c)],
+  (violations) => new OrderRejected({ violations }),
+);
+```
+
+`merge` receives a **non-empty** list, so there is no "shouldn't happen" branch;
+the record form gets `[key, error]` entries correlated per key. A `Defect` still
+dominates and discards the accumulated errors.
+
+For schema-shaped input (a request body, a form) reach for
+`@unthrown/standard-schema`'s `fromSchema` instead — a validator already hands
+you every issue as one modeled error. There is still no `Validation` applicative;
+do not fake one.
 
 ## The seam (untouched neverthrow callers)
 
