@@ -5,6 +5,7 @@ Contents: [Testing: @unthrown/vitest](#testing-unthrownvitest) ·
 [Prisma](#prisma-unthrownprisma) · [Drizzle](#drizzle-unthrowndrizzle) ·
 [oRPC](#orpc-unthrownorpc) ·
 [Validation: @unthrown/standard-schema](#validation-unthrownstandard-schema) ·
+[Sagas: @unthrown/saga](#sagas-unthrownsaga) ·
 [Interop bridges](#interop-bridges-effect-neverthrow-boxed)
 
 Every satellite takes core (`unthrown`) as a peer/`workspace:^` dependency —
@@ -36,9 +37,9 @@ wiring exports: the seven raw matcher functions, `failOnForgottenAwait`, and the
 
 ## Linting: @unthrown/oxlint
 
-An oxlint JS plugin (peer `oxlint`). Eight rules. The type-shaped ones
+An oxlint JS plugin (peer `oxlint`). Nine rules. The type-shaped ones
 (`no-ambiguous-error-type`, `prefer-async-result`, `no-unhandled-result`,
-`no-async-result-race`, `no-catch-all-pattern`) resolve bindings by scope analysis, so they only fire
+`no-async-result-race`, `no-catch-all-pattern`, `prefer-pre-lifted`) resolve bindings by scope analysis, so they only fire
 on unthrown's own `Result` — another library's is left alone. Three are keyed
 on a name or shape instead, and need no import to resolve:
 `no-unused-matcher` (the `…Cases` method names), `no-get-or-throw` (a
@@ -54,14 +55,20 @@ statement itself — it reports every `throw`, in any file).
   existing `unthrown` import when needed (no autofix on `async` function return annotations or
   function-type return positions — those must stay `Promise`).
 - `no-unhandled-result` — flags a bare expression statement dropping a
-  `Result` (syntactic; a dropped method chain is out of scope).
+  `Result` from an unthrown producer or an in-file function annotated
+  `Result`/`AsyncResult`. Syntactic: it misses a result returned by an
+  **imported** user function and a dropped method chain (`r.map(f);`). No
+  type-aware rule backs it up: typescript-eslint's `no-floating-promises`
+  ignores `AsyncResult` (its `then` has no rejection callback), so bind or
+  return every call you cannot see resolved.
 - `no-async-result-race` — flags a sibling `AsyncResult` construction while an
   earlier binding in the same statement list is still unconsumed: construction
   is eager, so the sibling-`const` sequence races. Chaining and the one-statement
   join (`allAsync([a, b])`) are exempt; manual start-both-await-both is
   reported — its sanctioned spelling is `allAsync`, and a deliberate site
   carries a targeted `oxlint-disable` with a reason.
-- `no-catch-all-pattern` — reports `P._` (and ts-pattern's `P.any`); self-exempts
+- `no-catch-all-pattern` — reports `P._` (and ts-pattern's `P.any`, and the
+  empty object pattern `.with({}, …)`, which matches every object); self-exempts `P._`
   when an in-file `Result` annotation proves `E` is a single non-union type or
   an unresolved generic; unprovable keep-the-wildcard sites carry a targeted
   `oxlint-disable` with a reason.
@@ -112,7 +119,12 @@ db.user.tryFindMany();
   404). Only the **batch** mutations (`createMany` / `updateMany` and their
   `*AndReturn` twins) are free of `RecordNotFound` — they take no nested
   writes. `create` and `upsert` DO carry it: a nested `connect` can point at a
-  row that does not exist.
+  row that does not exist. `delete` / `deleteMany` carry
+  `UniqueConstraintViolation` (an `onDelete: SetDefault` rewrite can hit a
+  unique index).
+- A modeled error's `cause` (the Prisma error, which quotes the call and its
+  values) is non-enumerable, so `JSON.stringify` skips it — but still never send
+  a modeled error to a client unmapped; map each tag to a response.
 - **Everything infrastructural is a defect** — dropped connections, pool
   timeouts, deadlocks, unmapped P-codes, malformed queries, engine panics.
   There is no `DriverError` class. Nobody branches on those in domain code, so
@@ -129,14 +141,17 @@ db.user.tryFindMany();
   collapses to a list.
 - `tryPaginate(...).withCursor(...)` — cursor pagination; its `E` is
   `InvalidCursor` (the cursor is the only part of the query that came from
-  outside). `after` and `before` are mutually exclusive.
+  outside) — a throwing `parseCursor` or a validation error. A value the
+  database refuses (P2023 / P2007 on a uuid id) stays a defect: validate the
+  format in `parseCursor` to make it an `InvalidCursor`. `after` and `before` are mutually
+  exclusive. The default cursor escapes an all-digits **string** id as `~42`.
 - `qualifyPrismaError` — the exported qualify, for hand-rolled boundaries.
 - Raw methods remain the escape hatch for raw SQL, and are what a batch
   `$tryTransaction([...])` is composed from.
 
 ## Drizzle: @unthrown/drizzle
 
-Peers `drizzle-orm` ^1.0.0-rc and `pg` ^8.16.0. Unlike the Prisma extension this
+Peers `drizzle-orm` ^1.0.0-rc.5-0 and `pg` ^8.16.0. Unlike the Prisma extension this
 **replaces** the stock database rather than adding to it — every method already
 speaks `AsyncResult`, so there is **no `try*` prefix**, and migrating a call
 site is an import change:
@@ -160,7 +175,9 @@ const rows = (await db.select().from(users)).get();
   `refreshMaterializedView`, `prepare(name).execute()` included. Enforced at
   runtime (they route through `fromSafePromise`), so a stray `23xxx` on a read
   path becomes a `Defect`, never an `Err` the type denies. `never` does not mean
-  infallible: `get()` still panics on a defect.
+  infallible: `get()` still panics on a defect. Exception: a select built by
+  `db.with(cte)` over a **writing** CTE (`$with(…).as(db.insert(…).returning())`,
+  or raw SQL) carries `PgQueryError` — Postgres runs the write.
 - **Writes carry the whole `PgQueryError` union**, unnarrowed —
   `insert`, `update`, `delete`, ``db.execute(sql`…`)``, `transaction`:
   `UniqueConstraintViolation` (23505), `ForeignKeyViolation` (23503),
@@ -177,7 +194,12 @@ const rows = (await db.select().from(users)).get();
   `Err` re-surfaces typed. There is deliberately **no `tx.rollback()`**:
   rollback _is_ returning an `Err`. `PgQueryError` joins the result's channel
   whatever the callback's own `E` (a `DEFERRABLE` constraint is checked at
-  `COMMIT`), so `get()` never compiles on a transaction. Nesting is a savepoint.
+  `COMMIT`), so `get()` never compiles on a transaction. Nesting is a savepoint;
+  nested transactions on one handle run one after another (safe under
+  `allAsync`), so start deeper nesting on the handle a nested callback receives.
+- A modeled error's `detail` (row values) and `cause` (SQL + params) are
+  non-enumerable, so `JSON.stringify` skips them — but still never send a
+  modeled error to a client unmapped.
 - `qualifyPgError` — the exported qualify, for hand-rolled boundaries.
 - `db.$client` is the escape hatch: a stock `drizzle-orm/node-postgres` db over
   the same `Pool` is one line.
@@ -200,7 +222,10 @@ Peers `@orpc/client` + `@orpc/contract` + optional `@orpc/server`
 - `@unthrown/orpc/client` — `fromCall(promise)` lifts one call;
   `createResultClient(client, { contract })` wraps a whole router; the
   `contract` reconciles each rejection against the client's own `.errors()`, so
-  a code only a newer server declares is a `Defect`. `E` is the raw defined
+  a code only a newer server declares (or declared-code `data` failing its
+  schema) is a `Defect`. Without a `contract` — and always with `fromCall` —
+  the server's `defined` flag decides and `error.data` is **unvalidated**:
+  pass the contract against an untrusted server. `E` is the raw defined
   `ORPCError` union discriminated by `code` — match with
   `.with({ code: "NOT_FOUND" }, …)`, not `P.tag`.
 - Event-iterator (streaming) procedures are out of scope — use the raw client.
@@ -223,6 +248,20 @@ parseUser(input); // Result<User, SchemaIssues>
 asynchronously — use `fromSchemaAsync` for those.
 
 The validation issues are the modeled `E` — no throwing parse.
+
+## Sagas: @unthrown/saga
+
+Peer `unthrown`. Two exports: `SagaAsync()` and its `SagaAsyncBuilder` type.
+`step(run, undo?)` records a compensating undo; the first failing step unwinds
+the recorded undos **LIFO**, then the failure comes back **unchanged**, so the
+caller triages exactly what it would have without the saga. `run()` answers the
+last step's value. Both arguments are **thunks** (an `AsyncResult` starts on
+construction, so an eagerly-built undo would run whether or not it was
+needed); `undo` receives its own step's value. An undo may not add a modeled
+error (`never` in its Err channel); a **defect** in an undo wins over the
+triggering failure, after the remaining undos run. Pure control flow — no
+timers or clock — so it replays deterministically in a workflow sandbox.
+Example: [api.md § Saga](api.md#saga).
 
 ## Interop bridges (effect, neverthrow, boxed)
 

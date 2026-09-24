@@ -7,7 +7,7 @@
 // This pins the part that is mechanically checkable: the rule inventory. The
 // prose still needs a human, but the inventory is where the drift showed up.
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -78,5 +78,44 @@ describe("the agent skill's rule inventory matches the plugin", () => {
 
     expect(listed(presetSection)).toEqual(RECOMMENDED);
     expect(listed(optInSection)).toEqual(RULE_NAMES.filter((name) => !RECOMMENDED.includes(name)));
+  });
+});
+
+// The root README's package table drifted the same way (it listed six of the
+// nine rules and no `@unthrown/saga`). Pin its inventory too.
+describe("the root README's package table matches the workspace", () => {
+  const readme = readFileSync(
+    fileURLToPath(new URL("../../../README.md", import.meta.url)),
+    "utf8",
+  );
+
+  // The table under `## Packages`, one row per package keyed by its name —
+  // scoped so a rule or package mentioned elsewhere in the README can't pass.
+  const section = readme.slice(readme.indexOf("## Packages"));
+  const rows = new Map(
+    [...section.slice(0, section.indexOf("\n## ", 1)).matchAll(/^\| \[`([^`]+)`\].*$/gm)].map(
+      ([row, name]) => [name!, row],
+    ),
+  );
+
+  it("names every rule the plugin ships in the oxlint row", () => {
+    const row = rows.get("@unthrown/oxlint") ?? "";
+    expect(RULE_NAMES.filter((name) => !row.includes(`\`${name}\``))).toEqual([]);
+  });
+
+  it("has a row for every published package", () => {
+    const packagesDir = new URL("../../", import.meta.url);
+    const published = readdirSync(packagesDir)
+      .map(
+        (dir) =>
+          JSON.parse(readFileSync(new URL(`${dir}/package.json`, packagesDir), "utf8")) as {
+            name: string;
+            private?: boolean;
+          },
+      )
+      .filter((pkg) => pkg.private !== true)
+      .map((pkg) => pkg.name);
+    expect(published).toContain("unthrown");
+    expect(published.filter((name) => !rows.has(name))).toEqual([]);
   });
 });

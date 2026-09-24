@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { entityKind } from "drizzle-orm/entity";
 import { type Logger, NoopLogger } from "drizzle-orm/logger";
 import type { NodePgQueryResultHKT } from "drizzle-orm/node-postgres/session";
@@ -10,6 +12,7 @@ import pg from "pg";
 import {
   type AsyncResult,
   fromPromise,
+  fromSafePromise,
   isErr,
   isOk,
   isResult,
@@ -366,15 +369,33 @@ export class NodePgUnthrownSession<
     // leaves nothing to release; everything after it is released whatever
     // happens, a rejecting control statement included.
     const pooled = isPool(this.client) ? await this.client.connect() : undefined;
+    // Why this connection can no longer be trusted, if it cannot: the driver
+    // reported it broken, or a ROLLBACK failed and left the transaction's state
+    // unknown. Either way it is destroyed rather than handed back to the pool
+    // for the next borrower to inherit.
+    let broken: unknown;
+    // The pool detaches its own `error` listener on checkout, so a connection
+    // dropping mid-transaction would emit an unhandled `error` and crash the
+    // process. The in-flight query rejects on its own account and is qualified
+    // as usual; this only keeps the event from being fatal, and remembers it.
+    const onError = (error: unknown): void => {
+      broken ??= error;
+    };
+    pooled?.on("error", onError);
     try {
       const session =
         pooled === undefined
           ? this
           : new NodePgUnthrownSession(pooled, this.dialect, this.relations, this.logger);
       const tx = new NodePgUnthrownTransaction(this.dialect, session, this.relations);
+      const control = controlOn(session, this.dialect);
 
       return await runScope(
-        controlOn(session, this.dialect),
+        (statement) =>
+          control(statement).catch((cause: unknown) => {
+            if (statement === "rollback") broken ??= cause;
+            throw cause;
+          }),
         {
           begin: beginStatement(config),
           keep: "commit",
@@ -384,7 +405,10 @@ export class NodePgUnthrownSession<
         fn,
       );
     } finally {
-      pooled?.release();
+      pooled?.off("error", onError);
+      // `release(true)` is pg-pool's "destroy it": the client is closed and
+      // dropped instead of rejoining the idle set.
+      pooled?.release(broken !== undefined);
     }
   }
 }
@@ -404,6 +428,12 @@ export class NodePgUnthrownSession<
  *
  * @category Session
  */
+/**
+ * The transaction handles whose nested-transaction lock the current async
+ * context holds — i.e. whose nested callback is running here. @internal
+ */
+const holding = new AsyncLocalStorage<ReadonlySet<object>>();
+
 export class NodePgUnthrownTransaction<
   TRelations extends AnyRelations = EmptyRelations,
 > extends PgUnthrownDatabase<NodePgQueryResultHKT, TRelations> {
@@ -460,6 +490,16 @@ export class NodePgUnthrownTransaction<
    * one connection, and the first `rollback to savepoint sp1` would unwind the
    * other's work.
    *
+   * Distinct names are not enough on their own, because savepoints are a
+   * *stack*: rolling back to `sp1` also discards an `sp2` opened after it. So
+   * nested transactions started on one handle **run one after another**, in the
+   * order they were started — `allAsync([tx.transaction(a), tx.transaction(b)])`
+   * is safe, and each keeps its own outcome. Start a nested transaction from
+   * inside a nested callback through the handle that callback receives: the
+   * enclosing handle is busy until that callback finishes, so a transaction
+   * started on it from inside could only wait for itself — it is a `Defect`
+   * (a `TypeError` naming the mistake) instead.
+   *
    * @example
    * ```ts
    * const result = await db.transaction((tx) =>
@@ -484,8 +524,34 @@ export class NodePgUnthrownTransaction<
   transaction<A, E>(
     fn: (tx: NodePgUnthrownTransaction<TRelations>) => AsyncResult<A, E>,
   ): AsyncResult<A, E | PgQueryError> {
-    return fromPromise(() => this.#runSavepoint(fn), qualifyPgError).flatMap((inner) => inner);
+    // Queued behind every nested transaction already started on this handle.
+    // Savepoints are a stack on the connection, so two siblings in flight at
+    // once interleave: the first `rollback to savepoint` also unwinds the one
+    // opened after it — the other's writes vanish while it still reports `Ok`,
+    // or its own `release` fails with 3B001. Distinct names cannot fix that;
+    // only running siblings one after another can.
+    // The lock is per handle, so a nested callback that starts a transaction
+    // on the ENCLOSING handle would wait for itself forever. The async context
+    // knows which handles' callbacks are running here: that call is a Defect
+    // instead of a hang.
+    if (holding.getStore()?.has(this)) {
+      return fromSafePromise(
+        Promise.reject(
+          new TypeError(
+            "A nested transaction was started on the enclosing handle from inside one of its own nested callbacks, which would wait for itself forever — start it on the handle the callback receives.",
+          ),
+        ),
+      );
+    }
+    const held = new Set(holding.getStore()).add(this);
+    const guarded = (tx: NodePgUnthrownTransaction<TRelations>) => holding.run(held, () => fn(tx));
+    const run = this.#nested.then(() => this.#runSavepoint(guarded));
+    this.#nested = run.then(noop, noop);
+    return fromPromise(run, qualifyPgError).flatMap((inner) => inner);
   }
+
+  /** Settles once every nested transaction started on this handle has finished. */
+  #nested: Promise<unknown> = Promise.resolve();
 
   /** The savepoint as a promise that may reject — see `#runTransaction`. */
   async #runSavepoint<A, E>(

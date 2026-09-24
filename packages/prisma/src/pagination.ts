@@ -37,7 +37,9 @@ export type CursorPaginationMeta = {
  * The default cursor is the record's `id` field, serialized with `String` and
  * parsed back to a number when it is all digits (autoincrement ids) — a bigint
  * once it exceeds `Number.MAX_SAFE_INTEGER`, so `BigInt` ids never lose
- * precision — or kept as a string otherwise (uuid / cuid ids). Provide
+ * precision — or kept as a string otherwise (uuid / cuid ids). A **string** id
+ * that is itself all digits is serialized with a leading `~` (`"~123"`), so it
+ * parses back to the string rather than to a number. Provide
  * `getCursor` / `parseCursor` for composite keys, or when the selection omits
  * `id`.
  *
@@ -45,7 +47,7 @@ export type CursorPaginationMeta = {
  * @typeParam Cursor - the model's `cursor` input (its unique-where shape).
  */
 export type CursorPaginationOptions<Row, Cursor> = {
-  /** Serialize a row into an opaque cursor. Defaults to `String(row.id)`. */
+  /** Serialize a row into an opaque cursor. Defaults to `row.id`, as described above. */
   getCursor?: (row: Row) => string;
   /** Parse an opaque cursor back into the model's `cursor` input. */
   parseCursor?: (cursor: string) => Cursor;
@@ -93,14 +95,21 @@ const defaultGetCursor = (row: unknown): string => {
         "(composite key, or a selection omitting `id`?). Provide getCursor/parseCursor.",
     );
   }
-  return String(id);
+  // A STRING id that looks numeric ("123", or one already carrying the escape)
+  // is escaped with a leading `~`, so the parser below can tell it from a
+  // numeric id. Without it an all-digits string id parsed back to a number and
+  // every cursor on that model came back InvalidCursor. Every other id
+  // serializes exactly as it always did.
+  return typeof id === "string" && /^~*\d+$/.test(id) ? `~${id}` : String(id);
 };
 
 // Preserve the id's type through the round-trip: an all-digits cursor parses
 // back to a number (autoincrement ids) — or a bigint once it exceeds
-// Number.MAX_SAFE_INTEGER, so a BigInt id never loses precision — and anything
-// else stays a string (uuid / cuid).
+// Number.MAX_SAFE_INTEGER, so a BigInt id never loses precision — an escaped
+// one (`~123`) back to the string it was, and anything else stays a string
+// (uuid / cuid).
 const defaultParseCursor = (cursor: string): unknown => {
+  if (/^~+\d+$/.test(cursor)) return { id: cursor.slice(1) };
   if (!/^\d+$/.test(cursor)) return { id: cursor };
   const n = Number(cursor);
   return { id: Number.isSafeInteger(n) ? n : BigInt(cursor) };
